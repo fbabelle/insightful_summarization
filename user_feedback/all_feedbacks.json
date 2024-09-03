@@ -1,0 +1,114 @@
+[
+  {
+    "timestamp": "2024-09-03T12:09:13.868316",
+    "summary": "This is a sample summary of a document.",
+    "explanation": "This is an explanation of how the summary was generated.",
+    "ratings": {
+      "clarity": 3,
+      "accuracy": 5,
+      "completeness": 3,
+      "explanation_helpfulness": 3
+    },
+    "text_feedback": {
+      "strengths": "No comment",
+      "weaknesses": "nothing",
+      "additional_comments": "no"
+    }
+  },
+  {
+    "timestamp": "2024-09-03T12:11:29.819805",
+    "summary": "This is sample summary 1.",
+    "explanation": "This is explanation for summary 1.",
+    "ratings": {
+      "clarity": 3,
+      "accuracy": 3,
+      "completeness": 3,
+      "explanation_helpfulness": 3
+    },
+    "text_feedback": {
+      "strengths": "3",
+      "weaknesses": "3",
+      "additional_comments": "3"
+    }
+  },
+  {
+    "timestamp": "2024-09-03T12:11:33.620817",
+    "summary": "This is sample summary 2.",
+    "explanation": "This is explanation for summary 2.",
+    "ratings": {
+      "clarity": 3,
+      "accuracy": 3,
+      "completeness": 3,
+      "explanation_helpfulness": 3
+    },
+    "text_feedback": {
+      "strengths": "3",
+      "weaknesses": "3",
+      "additional_comments": "3"
+    }
+  },
+  {
+    "timestamp": "2024-09-03T12:11:36.230065",
+    "summary": "This is sample summary 3.",
+    "explanation": "This is explanation for summary 3.",
+    "ratings": {
+      "clarity": 3,
+      "accuracy": 3,
+      "completeness": 3,
+      "explanation_helpfulness": 3
+    },
+    "text_feedback": {
+      "strengths": "3",
+      "weaknesses": "3",
+      "additional_comments": "3"
+    }
+  },
+  {
+    "timestamp": "2024-09-03T12:13:32.866802",
+    "summary": "This is sample summary 1.",
+    "explanation": "This is explanation for summary 1.",
+    "ratings": {
+      "clarity": 1,
+      "accuracy": 1,
+      "completeness": 1,
+      "explanation_helpfulness": 1
+    },
+    "text_feedback": {
+      "strengths": "1",
+      "weaknesses": "1",
+      "additional_comments": "1"
+    }
+  },
+  {
+    "timestamp": "2024-09-03T12:13:34.073947",
+    "summary": "This is sample summary 2.",
+    "explanation": "This is explanation for summary 2.",
+    "ratings": {
+      "clarity": 1,
+      "accuracy": 1,
+      "completeness": 1,
+      "explanation_helpfulness": 1
+    },
+    "text_feedback": {
+      "strengths": "1",
+      "weaknesses": "1",
+      "additional_comments": "1"
+    }
+  },
+  {
+    "timestamp": "2024-09-03T12:13:35.306936",
+    "summary": "This is sample summary 3.",
+    "explanation": "This is explanation for summary 3.",
+    "ratings": {
+      "clarity": 1,
+      "accuracy": 1,
+      "completeness": 1,
+      "explanation_helpfulness": 1
+    },
+    "text_feedback": {
+      "strengths": "1",
+      "weaknesses": "1",
+      "additional_comments": "1"
+    }
+  }
+]
