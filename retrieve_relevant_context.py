@@ -1,138 +1,564 @@
-import pickle
 import os
+import sys
 import logging
-from typing import List, Dict
+from datetime import datetime
+import pickle
+from typing import List, Dict, Tuple, Union
+import hashlib
+import json
+import uuid
 from collections import Counter
-import math
+import numpy as np
+from transformers import AutoTokenizer, AutoModel
+import torch
+from __init__ import root_dir
+
+# Set up log directory and file
+log_dir = os.path.join(root_dir, 'log')
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, 'retrieved_history.log')
+
+print(f"Log directory: {log_dir}")
+print(f"Log file: {log_file}")
+
+def setup_logging():
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
+    # Create file handler
+    try:
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+        print(f"File handler added for {log_file}")
+    except Exception as e:
+        print(f"Error setting up file handler: {e}")
+
+    # Create console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+
+    return logger
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = setup_logging()
 
-class SimpleContextRetriever:
-    def __init__(self, index_path: str = '/home/dfoadmin/boqu/insightful_summarization/simple_context_index.pkl'):
+
+class EmbeddingGenerator:
+    def __init__(self, model_name='avsolatorio/NoInstruct-small-Embedding-v0'):
+        logger.info(f"Initializing EmbeddingGenerator with model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model.to(self.device)
+        logger.info(f"EmbeddingGenerator initialized. Device: {self.device}")
+
+    def generate_embeddings(self, texts, batch_size=32):
+        embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            inputs = self.tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+            batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            embeddings.append(batch_embeddings)
+        return np.vstack(embeddings)
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+def cluster_with_threshold(embeddings: np.ndarray, piece_ids: List[str], threshold: float) -> List[List[int]]:
+    clusters = []
+    id_to_cluster = {}
+    for i, (emb, piece_id) in enumerate(zip(embeddings, piece_ids)):
+        base_id = piece_id.split('_')[0]  # Assuming piece_id format: "base_id_piece_number"
+        if base_id in id_to_cluster:
+            clusters[id_to_cluster[base_id]].append(i)
+        else:
+            assigned = False
+            for j, cluster in enumerate(clusters):
+                if cosine_similarity(emb, embeddings[cluster[0]]) > threshold:
+                    cluster.append(i)
+                    id_to_cluster[base_id] = j
+                    assigned = True
+                    break
+            if not assigned:
+                id_to_cluster[base_id] = len(clusters)
+                clusters.append([i])
+    return clusters
+
+def improved_clustering(embeddings: np.ndarray, min_clusters: int = 5, max_clusters: int = None, initial_threshold: float = 0.9) -> List[List[int]]:
+    if max_clusters is None:
+        max_clusters = len(embeddings) // 10
+
+    # Initial clustering
+    clusters = cluster_with_threshold(embeddings, initial_threshold)
+
+    # If we have more than max_clusters, merge until we reach max_clusters
+    while len(clusters) > max_clusters:
+        # Find the two most similar clusters
+        max_similarity = -1
+        merge_indices = (-1, -1)
+        for i, c1 in enumerate(clusters):
+            for j, c2 in enumerate(clusters[i+1:], i+1):
+                sim = cosine_similarity(embeddings[c1[0]], embeddings[c2[0]])
+                if sim > max_similarity:
+                    max_similarity = sim
+                    merge_indices = (i, j)
+        
+        # Merge the most similar clusters
+        i, j = merge_indices
+        clusters[i].extend(clusters[j])
+        clusters.pop(j)
+
+    # If we have fewer than min_clusters, try to split by lowering the threshold
+    if len(clusters) < min_clusters:
+        thresholds_to_try = [initial_threshold + (1 - initial_threshold) * i / 4 for i in range(1, 4)]
+        
+        for new_threshold in thresholds_to_try:
+            new_clusters = cluster_with_threshold(embeddings, new_threshold)
+            if len(new_clusters) >= min_clusters:
+                return new_clusters
+            elif len(new_clusters) > len(clusters):
+                clusters = new_clusters  # Keep the improvement, but continue trying
+
+    return clusters
+
+class EnhancedContextRetriever:
+    def __init__(self, index_path: str = os.path.join(root_dir, 'embedding/content_embeddings.pkl')):
+        logger.info("Initializing EnhancedContextRetriever")
         self.index_path = index_path
-        self.corpora: Dict[str, List[str]] = {'scientific_paper': [], 'news': [], 'article': []}
-        self.tfidf: Dict[str, Dict[str, Dict[str, float]]] = {'scientific_paper': {}, 'news': {}, 'article': {}}
+        self.id_usage_path = os.path.join(os.path.dirname(index_path), 'id_usage.json')
+        self.corpora: Dict[str, List[Tuple[str, str, str, str]]] = {}  # (title, content, piece_id, unique_id)
+        self.embeddings: Dict[str, Dict[str, np.ndarray]] = {}
+        self.clusters: Dict[str, List[List[int]]] = {}
+        self.id_usage: Dict[str, str] = {}  # hash -> unique_id
+        self.embedding_generator = EmbeddingGenerator()
         self.load_index()
+        self.load_id_usage()
 
     def load_index(self) -> None:
-        """Load the index from disk if it exists."""
         if os.path.exists(self.index_path):
             try:
                 with open(self.index_path, 'rb') as f:
-                    self.corpora, self.tfidf = pickle.load(f)
+                    self.corpora, self.embeddings, self.clusters = pickle.load(f)
                 logger.info(f"Index loaded from {self.index_path}")
             except Exception as e:
                 logger.error(f"Error loading index: {str(e)}")
+                self.corpora, self.embeddings, self.clusters = {}, {}, {}
 
     def save_index(self) -> None:
-        """Save the index to disk."""
         try:
             with open(self.index_path, 'wb') as f:
-                pickle.dump((self.corpora, self.tfidf), f)
+                pickle.dump((self.corpora, self.embeddings, self.clusters), f)
             logger.info(f"Index saved to {self.index_path}")
         except Exception as e:
             logger.error(f"Error saving index: {str(e)}")
 
-    def add_documents(self, documents: List[str], domain: str) -> None:
-        """Add new documents to the index for a specific domain."""
-        self.corpora[domain].extend(documents)
-        self._update_tfidf(domain)
-        logger.info(f"Added {len(documents)} documents to {domain} domain")
+    def load_id_usage(self) -> None:
+        if os.path.exists(self.id_usage_path):
+            try:
+                with open(self.id_usage_path, 'r') as f:
+                    self.id_usage = json.load(f)
+                logger.info(f"ID usage loaded from {self.id_usage_path}")
+            except Exception as e:
+                logger.error(f"Error loading ID usage: {str(e)}")
+                self.id_usage = {}
+        else:
+            self.id_usage = {}
+            self.rebuild_id_usage()
 
-    def _update_tfidf(self, domain: str) -> None:
-        """Update TF-IDF scores for a specific domain."""
-        documents = self.corpora[domain]
-        word_doc_count = Counter()
-        for doc in documents:
-            word_doc_count.update(set(doc.lower().split()))
+    def save_id_usage(self) -> None:
+        try:
+            with open(self.id_usage_path, 'w') as f:
+                json.dump(self.id_usage, f)
+            logger.info(f"ID usage saved to {self.id_usage_path}")
+        except Exception as e:
+            logger.error(f"Error saving ID usage: {str(e)}")
 
-        for i, doc in enumerate(documents):
-            word_counts = Counter(doc.lower().split())
-            for word, count in word_counts.items():
-                tf = count / len(doc.split())
-                idf = math.log(len(documents) / (word_doc_count[word] + 1))
-                self.tfidf[domain].setdefault(word, {})[i] = tf * idf
+    def rebuild_id_usage(self) -> None:
+        self.id_usage = {}
+        for domain, docs in self.corpora.items():
+            for title, content, piece_id, unique_id in docs:
+                doc_hash = self.generate_hash(title, content)
+                self.id_usage[doc_hash] = unique_id
+        self.save_id_usage()
 
-    def retrieve(self, query: str, domain: str, k: int = 5) -> List[str]:
-        """Retrieve the k most relevant documents for the query from a specific domain."""
-        query_words = set(query.lower().split())
-        scores = [0] * len(self.corpora[domain])
-        for word in query_words:
-            if word in self.tfidf[domain]:
-                for doc_id, score in self.tfidf[domain][word].items():
-                    scores[doc_id] += score
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-        return [self.corpora[domain][i] for i in top_indices]
+    def generate_hash(self, title: str, content: str) -> str:
+        return hashlib.md5((title + content).encode()).hexdigest()
 
-def retrieve_relevant_context(document: str, domain: str, k: int = 5) -> List[str]:
-    """
-    Retrieve relevant context for the given document based on its domain.
-    
-    Args:
-    document (str): The text of the document
-    domain (str): The domain of the document ('scientific_paper', 'news', or 'article')
-    k (int): Number of relevant contexts to retrieve
-    
-    Returns:
-    List[str]: A list of relevant context snippets
-    """
-    retriever = SimpleContextRetriever()
+    def generate_unique_id(self) -> str:
+        return uuid.uuid4().hex
 
-    # If the index for this domain is empty, add some sample documents
+    def ensure_domain_initialized(self, domain: str) -> None:
+        if domain not in self.corpora:
+            self.corpora[domain] = []
+        if domain not in self.embeddings:
+            self.embeddings[domain] = {'title': None, 'content': None}
+        if domain not in self.clusters:
+            self.clusters[domain] = []
+
+    def add_documents(self, documents: List[Tuple[str, str]], domain: str, max_piece_length: int = 512) -> Dict[str, List[Tuple[str, str, str]]]:
+        self.ensure_domain_initialized(domain)
+
+        new_titles = []
+        new_contents = []
+        new_piece_ids = []
+        new_unique_ids = []
+        added_docs = []
+        skipped_docs = []
+
+        for doc_id, (title, content) in enumerate(documents):
+            pieces = [content[i:i+max_piece_length] for i in range(0, len(content), max_piece_length)]
+            doc_added = False
+            for piece_num, piece in enumerate(pieces):
+                piece_id = f"{doc_id}_{piece_num}"
+                doc_hash = self.generate_hash(title, piece)
+                
+                if doc_hash in self.id_usage:
+                    # Document already exists
+                    unique_id = self.id_usage[doc_hash]
+                    skipped_docs.append((title, piece, unique_id))
+                    logger.info(f"Skipped duplicate document: {title} (piece {piece_num + 1}/{len(pieces)})")
+                else:
+                    # New document
+                    unique_id = self.generate_unique_id()
+                    self.id_usage[doc_hash] = unique_id
+                    self.corpora[domain].append((title, piece, piece_id, unique_id))
+                    new_titles.append(title)
+                    new_contents.append(piece)
+                    new_piece_ids.append(piece_id)
+                    new_unique_ids.append(unique_id)
+                    added_docs.append((title, piece, unique_id))
+                    doc_added = True
+
+            if doc_added:
+                logger.info(f"Added document: {title} ({len(pieces)} pieces)")
+
+        if new_contents:
+            title_embeddings = self.embedding_generator.generate_embeddings(new_titles)
+            content_embeddings = self.embedding_generator.generate_embeddings(new_contents)
+
+            if self.embeddings[domain]['title'] is None:
+                self.embeddings[domain]['title'] = title_embeddings
+                self.embeddings[domain]['content'] = content_embeddings
+            else:
+                self.embeddings[domain]['title'] = np.vstack([self.embeddings[domain]['title'], title_embeddings])
+                self.embeddings[domain]['content'] = np.vstack([self.embeddings[domain]['content'], content_embeddings])
+
+            self._update_clusters(domain)
+
+        self.save_id_usage()
+        logger.info(f"Added {len(added_docs)} new documents ({len(new_piece_ids)} pieces) to {domain} domain")
+        logger.info(f"Skipped {len(skipped_docs)} duplicate documents")
+
+        return {
+            "added": added_docs,
+            "skipped": skipped_docs
+        }
+
+    def get_documents(self, domain: str, identifier: Union[str, int]) -> List[Tuple[str, str, str, str]]:
+        """
+        Retrieve documents from a specific domain based on title or index.
+        
+        :param domain: The domain to search in
+        :param identifier: Either the title (str) or index (int) of the document(s) to retrieve
+        :return: A list of tuples (title, content, piece_id, unique_id) matching the identifier
+        """
+        if domain not in self.corpora:
+            logger.warning(f"Domain '{domain}' not found.")
+            return []
+
+        results = []
+        if isinstance(identifier, str):
+            # Search by title
+            results = [doc for doc in self.corpora[domain] if doc[0] == identifier]
+        elif isinstance(identifier, int):
+            # Search by index
+            if 0 <= identifier < len(self.corpora[domain]):
+                results = [self.corpora[domain][identifier]]
+            else:
+                logger.warning(f"Index {identifier} is out of range for domain '{domain}'.")
+        else:
+            logger.warning(f"Invalid identifier type: {type(identifier)}. Must be str or int.")
+
+        logger.info(f"Retrieved {len(results)} documents from domain '{domain}' using identifier: {identifier}")
+        return results
+
+    def remove_documents(self, domain: str, identifiers: Union[List[str], List[int]]) -> None:
+        if domain not in self.corpora:
+            logger.warning(f"Domain '{domain}' not found. No documents removed.")
+            return
+
+        indices_to_remove = set()
+        for identifier in identifiers:
+            if isinstance(identifier, str):
+                # If identifier is a title (string)
+                indices = [i for i, (title, _, _, _) in enumerate(self.corpora[domain]) if title == identifier]
+                indices_to_remove.update(indices)
+            elif isinstance(identifier, int):
+                # If identifier is an index (integer)
+                if 0 <= identifier < len(self.corpora[domain]):
+                    indices_to_remove.add(identifier)
+                else:
+                    logger.warning(f"Index {identifier} is out of range for domain '{domain}'. Skipping.")
+            else:
+                logger.warning(f"Invalid identifier type: {type(identifier)}. Skipping.")
+
+        if not indices_to_remove:
+            logger.warning(f"No valid documents found to remove from domain '{domain}'.")
+            return
+
+        # Remove documents from corpora
+        self.corpora[domain] = [doc for i, doc in enumerate(self.corpora[domain]) if i not in indices_to_remove]
+
+        # Remove corresponding embeddings
+        mask = np.ones(len(self.embeddings[domain]['title']), dtype=bool)
+        mask[list(indices_to_remove)] = False
+        self.embeddings[domain]['title'] = self.embeddings[domain]['title'][mask]
+        self.embeddings[domain]['content'] = self.embeddings[domain]['content'][mask]
+
+        # Update clusters
+        self._update_clusters(domain)
+
+        logger.info(f"Removed {len(indices_to_remove)} documents from domain '{domain}'.")
+
+    def remove_domain(self, domain: str) -> None:
+        if domain in self.corpora:
+            del self.corpora[domain]
+            del self.embeddings[domain]
+            del self.clusters[domain]
+            logger.info(f"Domain '{domain}' and all its associated data have been removed.")
+        else:
+            logger.warning(f"Domain '{domain}' not found. No data removed.")
+
+    def _update_clusters(self, domain: str) -> None:
+        if self.embeddings[domain]['content'].size > 0:
+            self.clusters[domain] = cluster_with_threshold(self.embeddings[domain]['content'], 
+                                                           [doc[2] for doc in self.corpora[domain]], 
+                                                           threshold=0.9)
+        else:
+            self.clusters[domain] = []
+
+    def retrieve(self, input_title: str, input_content: str, domain: str, k: int = 5, title_weight: float = 0.5, alpha: float = 0.5, cluster_penalty: float = 0.2, content_penalty: float = 0.4) -> List[Tuple[str, str, str]]:
+        self.ensure_domain_initialized(domain)
+        
+        if len(self.corpora[domain]) == 0:
+            logger.warning(f"No documents found for domain: {domain}")
+            return []
+
+        # Generate embeddings for input title and content
+        input_title_embedding = self.embedding_generator.generate_embeddings([input_title])[0]
+        input_content_embedding = self.embedding_generator.generate_embeddings([input_content])[0]
+
+        # Calculate similarities for titles and contents
+        title_similarities = np.array([cosine_similarity(input_title_embedding, doc_emb) for doc_emb in self.embeddings[domain]['title']])
+        content_similarities = np.array([cosine_similarity(input_content_embedding, doc_emb) for doc_emb in self.embeddings[domain]['content']])
+        
+        # Combine title and content similarities using title_weight
+        combined_similarities = title_weight * title_similarities + (1 - title_weight) * content_similarities
+        
+        max_matches = min(k * 4, len(self.corpora[domain]))
+        top_matches = np.argsort(combined_similarities)[-max_matches:][::-1]
+        
+        cluster_counter = Counter()
+        content_counter = Counter()
+        final_matches = []
+        
+        for i in top_matches:
+            cluster = next((idx for idx, cluster in enumerate(self.clusters[domain]) if i in cluster), -1)
+            base_id = self.corpora[domain][i][2].split('_')[0]
+            
+            score = combined_similarities[i]
+            if cluster != -1 and cluster_counter[cluster] > k // 4:
+                score *= (1 - cluster_penalty)
+            
+            if content_counter[base_id] >= 1:
+                score *= (1 - content_penalty)
+            
+            final_matches.append((i, score, base_id))
+            cluster_counter[cluster] += 1
+            content_counter[base_id] += 1
+            
+            if len(set(match[2] for match in final_matches)) == k:
+                break
+        
+        final_matches.sort(key=lambda x: x[1], reverse=True)
+        
+        results = []
+        seen_base_ids = set()
+        for i, _, base_id in final_matches:
+            if base_id not in seen_base_ids:
+                title, content, _, unique_id = self.corpora[domain][i]
+                full_content = " ".join(piece for _, piece, piece_id, _ in self.corpora[domain] if piece_id.startswith(base_id))
+                results.append((title, full_content, unique_id))
+                seen_base_ids.add(base_id)
+            
+            if len(results) == k:
+                break
+        
+        logger.info(f"Retrieved {len(results)} documents for input in domain '{domain}'")
+        return results
+
+    def get_summary(self) -> str:
+        summary = []
+        total_chunks = sum(len(docs) for docs in self.corpora.values())
+        
+        summary.append(f"Total number of domains: {len(self.corpora)}")
+        summary.append(f"Total number of chunks across all domains: {total_chunks}")
+        
+        for domain, docs in self.corpora.items():
+            domain_chunks = len(docs)
+            domain_percentage = (domain_chunks / total_chunks) * 100 if total_chunks > 0 else 0
+            summary.append(f"\nDomain: {domain}")
+            summary.append(f"  Number of chunks: {domain_chunks} ({domain_percentage:.2f}% of total)")
+            
+            if domain in self.clusters:
+                num_clusters = len(self.clusters[domain])
+                summary.append(f"  Number of clusters: {num_clusters}")
+                
+                for i, cluster in enumerate(self.clusters[domain], 1):
+                    cluster_size = len(cluster)
+                    cluster_percentage = (cluster_size / domain_chunks) * 100
+                    summary.append(f"    Cluster {i}: {cluster_size} chunks ({cluster_percentage:.2f}% of domain)")
+            else:
+                summary.append("  No clusters found for this domain")
+        
+        logger.info("Generated summary of EnhancedContextRetriever")
+        return "\n".join(summary)
+
+def retrieve_relevant_context(title: str, content: str, domain: str, k: int = 5, title_weight: float = 0.5) -> List[Tuple[str, str, str]]:
+    retriever = EnhancedContextRetriever()
+    retriever.ensure_domain_initialized(domain)
+
     if len(retriever.corpora[domain]) == 0:
+        logger.info(f"No documents found for domain: {domain}. Adding sample documents.")
         sample_corpora = {
-            'scientific_paper': [
-                "The discovery of CRISPR-Cas9 revolutionized gene editing techniques.",
-                "Quantum entanglement was first proposed by Einstein, Podolsky, and Rosen in 1935.",
-                "The Human Genome Project completed the sequencing of human DNA in 2003.",
-                "The detection of gravitational waves confirmed a major prediction of Einstein's general theory of relativity.",
-                "The development of mRNA vaccines marked a breakthrough in immunology and virology."
+            'scientific_research_paper': [
+                ("CRISPR-Cas9 Discovery", "The discovery of CRISPR-Cas9 revolutionized gene editing techniques."),
+                ("Quantum Entanglement", "Quantum entanglement was first proposed by Einstein, Podolsky, and Rosen in 1935."),
+                ("Human Genome Project", "The Human Genome Project completed the sequencing of human DNA in 2003."),
             ],
             'news': [
-                "The fall of the Berlin Wall in 1989 marked the end of the Cold War era.",
-                "The 9/11 attacks in 2001 reshaped global geopolitics and security policies.",
-                "The 2008 financial crisis led to widespread economic reforms and regulations.",
-                "The COVID-19 pandemic in 2020 caused global lockdowns and economic disruption.",
-                "The Paris Agreement of 2015 set international targets for reducing greenhouse gas emissions."
+                ("Berlin Wall Fall", "The fall of the Berlin Wall in 1989 marked the end of the Cold War era."),
+                ("9/11 Attacks", "The 9/11 attacks in 2001 reshaped global geopolitics and security policies."),
+                ("COVID-19 Pandemic", "The COVID-19 pandemic in 2020 caused global lockdowns and economic disruption."),
             ],
             'article': [
-                "The rise of social media has transformed communication and information spread.",
-                "Artificial intelligence poses both opportunities and challenges for the job market.",
-                "The growing wealth gap is a pressing issue in many developed countries.",
-                "Climate change denial hinders effective environmental policy implementation.",
-                "The ethics of gene editing in humans is a contentious topic in bioethics."
+                ("Social Media Impact", "The rise of social media has transformed communication and information spread."),
+                ("AI and Employment", "Artificial intelligence poses both opportunities and challenges for the job market."),
+                ("Climate Change", "Climate change is a pressing global issue requiring immediate action and policy changes."),
             ]
         }
-        retriever.add_documents(sample_corpora[domain], domain)
+        
+        if domain in sample_corpora:
+            documents_to_add = sample_corpora[domain]
+        else:
+            # Create placeholder content for new domains
+            logger.warning(f"Creating placeholder content for new domain: {domain}")
+            documents_to_add = [
+                (f"{domain.capitalize()} Topic 1", f"This is a placeholder document for the {domain} domain."),
+                (f"{domain.capitalize()} Topic 2", f"Another placeholder document for the {domain} domain."),
+                (f"{domain.capitalize()} Topic 3", f"A third placeholder document for the {domain} domain."),
+            ]
+        
+        retriever.add_documents(documents_to_add, domain)
         retriever.save_index()
 
-    # Retrieve relevant context
-    relevant_contexts = retriever.retrieve(document, domain, k)
+    relevant_contexts = retriever.retrieve(title, content, domain, k=k, title_weight=title_weight)
     return relevant_contexts
 
+
 def main():
+    logger.info("Starting main function")
+    retriever = EnhancedContextRetriever()
+    
+    # Add some sample documents
+    sample_docs = {
+        'scientific_paper': [
+            ("CRISPR-Cas9 Discovery", "The discovery of CRISPR-Cas9 revolutionized gene editing techniques."),
+            ("Quantum Entanglement", "Quantum entanglement was first proposed by Einstein, Podolsky, and Rosen in 1935."),
+            ("Human Genome Project", "The Human Genome Project completed the sequencing of human DNA in 2003."),
+        ],
+        'news': [
+            ("Berlin Wall Fall", "The fall of the Berlin Wall in 1989 marked the end of the Cold War era."),
+            ("9/11 Attacks", "The 9/11 attacks in 2001 reshaped global geopolitics and security policies."),
+        ],
+        'article': [
+            ("Social Media Impact", "The rise of social media has transformed communication and information spread."),
+            ("AI and Employment", "Artificial intelligence poses both opportunities and challenges for the job market."),
+            ("Climate Change", "Climate change is a pressing global issue requiring immediate action and policy changes."),
+        ]
+    }
+    
+    for domain, docs in sample_docs.items():
+        logger.info(f"Adding documents to domain: {domain}")
+        retriever.add_documents(docs, domain)
+    
+    # Perform some retrievals
     documents = {
-        'scientific_paper': """
-        Recent advancements in CRISPR technology have allowed for more precise gene editing in human embryos.
-        This breakthrough builds upon the initial discovery of CRISPR-Cas9 and addresses previous concerns about off-target effects.
-        """,
-        'news': """
-        A major earthquake struck the coast of Japan today, triggering tsunami warnings across the Pacific.
-        This event echoes the devastating 2011 Tohoku earthquake and tsunami, raising concerns about nuclear plant safety.
-        """,
-        'article': """
-        The rapid advancement of artificial intelligence in recent years has sparked debates about its impact on employment.
-        While AI promises increased efficiency, there are growing concerns about job displacement across various sectors.
-        """
+        'scientific_paper':
+            ("title1","Recent advancements in CRISPR technology have allowed for more precise gene editing in human embryos."),
+        'news':
+            ("title2","A major earthquake struck the coast of Japan today, triggering tsunami warnings across the Pacific."),
+        'article':
+            ("title3","The rapid advancement of artificial intelligence in recent years has sparked debates about its impact on employment."),
     }
 
     for domain, doc in documents.items():
         logger.info(f"\nRetrieving context for {domain}:")
-        contexts = retrieve_relevant_context(doc, domain)
-        for i, context in enumerate(contexts, 1):
-            logger.info(f"{i}. {context}")
+        title, content = doc
+        contexts = retriever.retrieve(title, content, domain, k=2)
+        for i, (title, content, unique_id) in enumerate(contexts, 1):
+            logger.info(f"{i}. Title: {title}")
+            logger.info(f"   Unique ID: {unique_id}")
+            logger.info(f"   Content: {content[:100]}...")  # Truncated for brevity
+            logger.info("---")
+
+    # Print summary
+    logger.info("\nSummary of EnhancedContextRetriever:")
+    logger.info(retriever.get_summary())
+
+    # Test get_documents function
+    logger.info("\nTesting get_documents function:")
+    docs = retriever.get_documents('scientific_paper', "CRISPR-Cas9 Discovery")
+    for doc in docs:
+        logger.info(f"Title: {doc[0]}")
+        logger.info(f"Content: {doc[1][:100]}...")  # Truncated for brevity
+        logger.info(f"Piece ID: {doc[2]}")
+        logger.info(f"Unique ID: {doc[3]}")
+        logger.info("---")
+
+    # test remove_documents function
+    logger.info("\nTesting remove_documents function:")
+    retriever.remove_documents('news', ["Berlin Wall Fall", 1])
+    
+    # test remove_domain function
+    logger.info("\nTesting remove_domain function:")
+    retriever.remove_domain('new_domain')
+
+    # get summary again
+    logger.info("\nSummary of EnhancedContextRetriever after removal:")
+    logger.info(retriever.get_summary())
+
+    logger.info("Main function completed")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception("An error occurred in the main function")
+    finally:
+        # Ensure all logs are written before the script exits
+        for handler in logger.handlers:
+            handler.flush()
+            handler.close()
+        logging.shutdown()
+
+print("Script execution completed. Please check the log file for details.")
