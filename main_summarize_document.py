@@ -9,8 +9,9 @@ from generate_basic_summary import generate_basic_summary, prepare_for_retrieval
 from retrieve_relevant_context import retrieve_relevant_context
 from analyze_significance import analyze_document
 from fact_check import fact_check
-from integrated_insightful_summarization import generate_insightful_summary_with_refinement
+from integrated_insightful_summarization import generate_insightful_summary_with_refinement, enhance_summary_generation
 from prepare_document import prepare_documents
+import pdb, traceback
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -92,7 +93,8 @@ def summarize_document(document: Dict[str, str]) -> Dict[str, Any]:
         context = [(item[0], item[1]) for item in all_context]
 
         # Step 5: Generate insightful summary
-        insightful_summary = generate_insightful_summary_with_refinement(
+        generate_insightful_summary = enhance_summary_generation(generate_insightful_summary_with_refinement)
+        insightful_summary = generate_insightful_summary(
             title=title,
             basic_summary=basic_summaries,
             analysis=analysis,
@@ -140,8 +142,11 @@ if __name__ == "__main__":
     input_list = [
         # input_folder + "Ray Dalio & Deepak Chopra on Life and Death_interview_20240917_080247.txt",
         # input_folder + "document.json",
-        input_folder + "bwam071814.docx"
-        # input_folder + "2021 The Power of Scale for Parameter-Efficient Prompt Tuning.pdf"，
-        # "https://www.linkedin.com/pulse/overview-computer-vision-vivek-murugesan/"
+        # input_folder + "bwam071814.docx",
+        # input_folder + "2023 Reflexion- Language Agents with Verbal Reinforcement Learning.pdf",
+        # "https://www.linkedin.com/pulse/overview-computer-vision-vivek-murugesan/",
+        # "https://newdiscourses.com/2020/07/woke-wont-debate-you-heres-why/",
+        # "https://www.ipcc.ch/report/ar6/wg1/chapter/chapter-6/",
+        "https://www.linkedin.com/pulse/beautiful-deleveraging-chinese-characteristics-ray-dalio-d7aue/?trackingId=MU8aF7gGT9ScznzbiBcsrA%3D%3D",
     ]
     main(input_list)

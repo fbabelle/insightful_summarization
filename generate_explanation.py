@@ -51,7 +51,7 @@ def generate_explanation(verified_summary: str, original_text: str, context: Lis
             {"role": "system", "content": "You are an AI assistant specialized in explaining complex processes clearly and concisely."},
             {"role": "user", "content": prompt}
         ]
-        explanation = model_selection("gpt-4", messages=messages, temperature=0.7)
+        explanation = model_selection("gpt-4o", messages=messages, temperature=0.7)
         return explanation.strip()
     except Exception as e:
         logger.error(f"An error occurred while generating the explanation: {str(e)}")
@@ -97,12 +97,14 @@ def main():
 
     logger.info("Generating explanation...")
     explanation = generate_explanation(sample_summary, sample_original_text, sample_context)
+    logger.info("Explanation:")
+    logger.info(explanation)
+
+    # logger.info("Formatting explanation...")
+    # formatted_explanation = format_explanation(explanation)
     
-    logger.info("Formatting explanation...")
-    formatted_explanation = format_explanation(explanation)
-    
-    logger.info("Formatted Explanation:")
-    logger.info(formatted_explanation)
+    # logger.info("Formatted Explanation:")
+    # logger.info(formatted_explanation)
 
 if __name__ == "__main__":
     main()

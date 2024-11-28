@@ -5,6 +5,8 @@ import logging
 from functools import partial, lru_cache
 import multiprocessing
 import tiktoken
+from enum import Enum
+from dataclasses import dataclass
 from __init__ import model_selection, MAX_TOKENS
 
 # Set environment variable to avoid tokenizer parallelism warning
@@ -13,6 +15,196 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class DocumentType(Enum):
+    SCIENTIFIC_RESEARCH = "scientific_research_paper"
+    NEWS_ARTICLE = "news"
+    GENERAL_ARTICLE = "article"
+
+@dataclass
+class SignificanceCriteria:
+    description: str
+    evaluation_points: List[str]
+    weight: float
+
+class SignificanceScorer:
+    def __init__(self):
+        self.criteria_weights = {
+            DocumentType.SCIENTIFIC_RESEARCH: {
+                "novelty": 0.35,
+                "impact": 0.25,
+                "methodology": 0.25,
+                "citation_network": 0.15
+            },
+            DocumentType.NEWS_ARTICLE: {
+                "novelty": 0.20,
+                "impact": 0.40,
+                "methodology": 0.15,
+                "citation_network": 0.25
+            },
+            DocumentType.GENERAL_ARTICLE: {
+                "novelty": 0.25,
+                "impact": 0.35,
+                "methodology": 0.20,
+                "citation_network": 0.20
+            }
+        }
+
+    def calculate_significance(self, doc_type: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate significance scores based on document analysis"""
+        doc_type_enum = DocumentType(doc_type)
+        weights = self.criteria_weights[doc_type_enum]
+        scores = {}
+        
+        if doc_type == "scientific_research_paper":
+            scores = {
+                "novelty": self._score_novelty_research(analysis),
+                "impact": self._score_impact_research(analysis),
+                "methodology": self._score_methodology_research(analysis),
+                "citation_network": self._score_citation_research(analysis)
+            }
+        elif doc_type == "news":
+            scores = {
+                "novelty": self._score_novelty_news(analysis),
+                "impact": self._score_impact_news(analysis),
+                "methodology": self._score_methodology_news(analysis),
+                "citation_network": self._score_citation_news(analysis)
+            }
+        else:  # article
+            scores = {
+                "novelty": self._score_novelty_article(analysis),
+                "impact": self._score_impact_article(analysis),
+                "methodology": self._score_methodology_article(analysis),
+                "citation_network": self._score_citation_article(analysis)
+            }
+
+        weighted_scores = {
+            criteria: score * weights[criteria]
+            for criteria, score in scores.items()
+        }
+
+        return {
+            "raw_scores": scores,
+            "weighted_scores": weighted_scores,
+            "total_significance": sum(weighted_scores.values())
+        }
+
+    def _score_novelty_research(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'contributions' in analysis:
+            score += min(len(analysis['contributions']) * 0.2, 0.6)
+        if 'previous_work' in analysis:
+            score += 0.4 if analysis['previous_work'] else 0.0
+        return min(score, 1.0)
+
+    def _score_impact_research(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'impact' in analysis:
+            score += min(len(analysis['impact']) * 0.3, 0.6)
+        if 'results' in analysis:
+            score += min(len(analysis['results']) * 0.2, 0.4)
+        return min(score, 1.0)
+
+    def _score_methodology_research(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'methods' in analysis:
+            score += min(len(analysis['methods']) * 0.3, 0.9)
+        if 'key_terms' in analysis:
+            score += min(len(analysis['key_terms']) * 0.02, 0.1)
+        return min(score, 1.0)
+
+    def _score_citation_research(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'previous_work' in analysis:
+            score += 0.6 if analysis['previous_work'] else 0.0
+        if 'key_terms' in analysis:
+            score += min(len(analysis['key_terms']) * 0.08, 0.4)
+        return min(score, 1.0)
+
+    # Similar scoring methods for news articles
+    def _score_novelty_news(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'newsworthiness' in analysis:
+            score += 0.6
+        if 'time_relevance' in analysis:
+            score += 0.4
+        return min(score, 1.0)
+
+    def _score_impact_news(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'implications' in analysis:
+            score += min(len(analysis['implications']) * 0.3, 0.9)
+        if 'key_entities' in analysis:
+            score += min(len(analysis['key_entities']) * 0.02, 0.1)
+        return min(score, 1.0)
+
+    def _score_methodology_news(self, analysis: Dict[str, Any]) -> float:
+        return 0.5  # Base score for news articles
+
+    def _score_citation_news(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'key_entities' in analysis:
+            score += min(len(analysis['key_entities']) * 0.2, 1.0)
+        return min(score, 1.0)
+
+    # Scoring methods for general articles
+    def _score_novelty_article(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'main_argument' in analysis:
+            score += 0.5
+        if 'supporting_points' in analysis:
+            score += min(len(analysis['supporting_points']) * 0.1, 0.5)
+        return min(score, 1.0)
+
+    def _score_impact_article(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'calls_to_action' in analysis:
+            score += min(len(analysis['calls_to_action']) * 0.3, 0.6)
+        if 'message_type' in analysis:
+            score += 0.4
+        return min(score, 1.0)
+
+    def _score_methodology_article(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'supporting_points' in analysis:
+            score += min(len(analysis['supporting_points']) * 0.2, 0.6)
+        if 'key_phrases' in analysis:
+            score += min(len(analysis['key_phrases']) * 0.08, 0.4)
+        return min(score, 1.0)
+
+    def _score_citation_article(self, analysis: Dict[str, Any]) -> float:
+        score = 0.0
+        if 'key_phrases' in analysis:
+            score += min(len(analysis['key_phrases']) * 0.2, 1.0)
+        return min(score, 1.0)
+
+# Update the analyze_document function to include significance scoring
+def analyze_document(title: str, content: str, analysis_type: str) -> Dict[str, Any]:
+    """
+    Analyze the document and calculate its significance score.
+    """
+    if analysis_type not in PROMPTS:
+        raise ValueError(f"Invalid analysis type: {analysis_type}")
+
+    chunks = chunk_text(content)
+    
+    with multiprocessing.Pool() as pool:
+        chunk_analyses = pool.map(partial(analyze_chunk, analysis_type=analysis_type), chunks)
+    
+    merged_analysis = merge_analyses(chunk_analyses, analysis_type)
+    merged_analysis['title'] = title
+    
+    # Calculate significance score
+    scorer = SignificanceScorer()
+    doc_type = DocumentType(analysis_type)
+    significance_scores = scorer.calculate_significance(doc_type, merged_analysis)
+    
+    # Add significance scores to the analysis
+    merged_analysis['significance_analysis'] = significance_scores
+    
+    return merged_analysis
+
+
 
 PROMPTS = {
     'scientific_research_paper': """
@@ -64,13 +256,9 @@ PROMPTS = {
 
 @lru_cache(maxsize=128)
 def get_encoding(encoding_name: str = "cl100k_base") -> tiktoken.Encoding:
-    """Returns the encoding for the specified name."""
     return tiktoken.get_encoding(encoding_name)
 
 def chunk_text(text: str, max_tokens: int = MAX_TOKENS // 2, overlap: float = 0.1) -> List[str]:
-    """
-    Split the text into overlapping chunks based on token count.
-    """
     encoding = get_encoding()
     tokens = encoding.encode(text)
     chunks = []
@@ -89,9 +277,6 @@ def chunk_text(text: str, max_tokens: int = MAX_TOKENS // 2, overlap: float = 0.
     return chunks
 
 def analyze_chunk(chunk: str, analysis_type: str) -> Dict[str, Any]:
-    """
-    Analyze a single chunk of text using GPT-4o based on the specified analysis type.
-    """
     if analysis_type not in PROMPTS:
         raise ValueError(f"Invalid analysis type: {analysis_type}")
 
@@ -103,8 +288,7 @@ def analyze_chunk(chunk: str, analysis_type: str) -> Dict[str, Any]:
 
     try:
         response = model_selection("gpt-4o", messages=messages, output_json=True, temperature=0.1)
-        analysis = json.loads(response)
-        return analysis
+        return json.loads(response)
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding JSON response: {str(e)}")
         return {"error": "Invalid JSON response from the model"}
@@ -169,27 +353,34 @@ def merge_analyses(analyses: List[Dict[str, Any]], analysis_type: str) -> Dict[s
     # Remove duplicates and limit list lengths
     for key in merged:
         if isinstance(merged[key], list):
-            merged[key] = list(dict.fromkeys(merged[key]))[:5]  # Keep top 5 unique items
+            merged[key] = list(dict.fromkeys(merged[key]))[:5]
         elif isinstance(merged[key], str):
             merged[key] = merged[key].strip()
 
     return merged
 
 def analyze_document(title: str, content: str, analysis_type: str) -> Dict[str, Any]:
-    """
-    Analyze the document by chunking the content, analyzing each chunk in parallel, and merging the results.
-    """
+    """Analyze the document and calculate its significance score."""
     if analysis_type not in PROMPTS:
         raise ValueError(f"Invalid analysis type: {analysis_type}")
 
+    # Analyze content
     chunks = chunk_text(content)
-    
     with multiprocessing.Pool() as pool:
         chunk_analyses = pool.map(partial(analyze_chunk, analysis_type=analysis_type), chunks)
     
     merged_analysis = merge_analyses(chunk_analyses, analysis_type)
     merged_analysis['title'] = title
-    
+
+    # Calculate significance score
+    scorer = SignificanceScorer()
+    try:
+        significance_scores = scorer.calculate_significance(analysis_type, merged_analysis)
+        merged_analysis['significance_analysis'] = significance_scores
+    except Exception as e:
+        logger.error(f"Error calculating significance: {str(e)}")
+        merged_analysis['significance_analysis'] = {"error": str(e)}
+
     return merged_analysis
 
 def main():

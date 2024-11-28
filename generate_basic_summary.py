@@ -4,7 +4,7 @@ import json
 from typing import Dict, Any, Optional, List
 from functools import lru_cache, partial
 import multiprocessing
-from __init__ import model_selection, MAX_TOKENS
+from __init__ import model_selection, MAX_TOKENS, summary_cache, depth_manager, AnalysisDepth
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,7 +20,7 @@ def num_tokens_from_string(string: str, encoding_name: str = "cl100k_base") -> i
     encoding = get_encoding(encoding_name)
     return len(encoding.encode(string))
 
-def chunk_text(text: str, max_tokens: int = MAX_TOKENS // 2, overlap: float = 0.1) -> List[str]:
+def chunk_text(text: str, max_tokens: int = MAX_TOKENS, overlap: float = 0.1) -> List[str]:
     """
     Split the text into overlapping chunks based on token count.
     
@@ -83,14 +83,15 @@ def generate_summary_for_chunk(chunk: str, max_summary_tokens: int = 500) -> Dic
         response = model_selection("gpt-4o", messages=messages, output_json=True, temperature=0.5)
         result = json.loads(response.strip())
         
-        logger.info(f"Summary generated successfully. Length: {len(result['basic_summary'])} characters")
+        logger.info(f"Summary generated successfully. Length: {num_tokens_from_string(result['basic_summary'])} tokens")
         return result
 
     except Exception as e:
         logger.error(f"An error occurred during summary generation: {str(e)}")
         return {"basic_summary": f"Error: Unable to generate summary. {str(e)}", "key_points": []}
 
-def generate_basic_summary(document: str, max_summary_tokens: int = 500) -> List[Dict[str, Any]]:
+# def generate_basic_summary(document: str, max_summary_tokens: int = 2000) -> List[Dict[str, Any]]:
+def generate_basic_summary(document: str, doc_type: str, time_constraint: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Generate basic summaries and key points for the given document, handling long texts with chunking and parallelization.
     
@@ -100,13 +101,52 @@ def generate_basic_summary(document: str, max_summary_tokens: int = 500) -> List
     Returns:
     List[Dict[str, Any]]: A list of dictionaries, each containing a basic summary and key points for a chunk of the document
     """
-    chunks = chunk_text(document, max_tokens=MAX_TOKENS // 2, overlap=0.1)
     
-    # Create a pool of workers
-    with multiprocessing.Pool() as pool:
-        # Map the chunks to the generate_summary_for_chunk function in parallel
-        results = pool.map(generate_summary_for_chunk, chunks, max_summary_tokens)
+    # Determine appropriate depth
+    depth = depth_manager.determine_depth(doc_type, len(document), time_constraint)
+    config = depth_manager.get_config(depth)
+
+    # Cache key based on the document hash and max summary tokens
+    cache_key = f"summary:{hash(document)}:{config.max_summary_tokens}"
     
+    # Check cache first
+    cached_result = summary_cache.get(cache_key)
+    if cached_result is not None:
+        logger.info("Cache hit for basic summary generation")
+        return cached_result
+
+    # chunks = chunk_text(document, max_tokens=MAX_TOKENS, overlap=0.1)
+
+    # Use configuration for chunking
+    chunks = chunk_text(
+        document, 
+        max_tokens=config.chunk_size, 
+        overlap=config.overlap
+    )
+    
+    # # Create a pool of workers
+    # with multiprocessing.Pool() as pool:
+    #     # Map the chunks to the generate_summary_for_chunk function in parallel
+    #     results = pool.map(generate_summary_for_chunk, chunks, max_summary_tokens)
+    
+    # Process based on configuration
+    if config.parallel_processing:
+        with multiprocessing.Pool() as pool:
+            results = pool.map(
+                partial(generate_summary_for_chunk, 
+                       max_summary_tokens=config.max_summary_tokens),
+                chunks
+            )
+    else:
+        results = [
+            generate_summary_for_chunk(chunk, max_summary_tokens=config.max_summary_tokens) 
+            for chunk in chunks
+        ]
+
+    # Cache the result
+    token_count = sum(num_tokens_from_string(str(result)) for result in results)
+    summary_cache.put(cache_key, results, token_count)
+
     return results
 
 def prepare_for_retrieval(summaries: List[Dict[str, Any]], title: str, classification: str) -> List[Dict[str, Any]]:
@@ -154,7 +194,7 @@ def main():
     document_title = "The Impact and Challenges of Climate Change"
     document_classification = "scientific_research_paper"
     
-    summaries = generate_basic_summary(document)
+    summaries = generate_basic_summary(document, document_classification)
     logger.info("Summaries and Key Points:")
     for i, summary in enumerate(summaries, 1):
         logger.info(f"Chunk {i}:")

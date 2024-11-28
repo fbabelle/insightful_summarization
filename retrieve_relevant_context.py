@@ -3,14 +3,20 @@ import sys
 import logging
 from datetime import datetime
 import pickle
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Optional, Any
 import hashlib
 import json
 import uuid
+import math
 from collections import Counter
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
+from dataclasses import dataclass
+from functools import partial
 from __init__ import root_dir
 
 # Set up log directory and file
@@ -49,26 +55,162 @@ def setup_logging():
 logger = setup_logging()
 
 
+
+@dataclass
+class EmbeddingConfig:
+    model_name: str = 'avsolatorio/NoInstruct-small-Embedding-v0'
+    batch_size: int = 32
+    max_length: int = 512
+    fallback_to_single: bool = True
+    min_batch_size: int = 4
+    master_port: str = '12355'
+
+class DistributedEmbeddingGenerator:
+    def __init__(self, config: EmbeddingConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        self.is_distributed = self.num_gpus > 1
+        
+        # Initialize model and tokenizer for single-device fallback
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        self.model = AutoModel.from_pretrained(config.model_name).to(self.device)
+        if self.device.type == 'cuda':
+            self.model = self.model.half()  # Use half precision for GPU
+        
+        self.logger.info(f"Initialized with {self.num_gpus} GPUs. Distributed: {self.is_distributed}")
+
+    def _split_texts(self, texts: List[str]) -> List[List[str]]:
+        """Split texts into balanced chunks for each GPU."""
+        if not texts:
+            return []
+        
+        n = len(texts)
+        chunk_size = math.ceil(n / self.num_gpus)
+        return [texts[i:i + chunk_size] for i in range(0, n, chunk_size)]
+
+    def _process_batch(self, texts: List[str], device: torch.device) -> np.ndarray:
+        """Process a single batch of texts on the specified device."""
+        if not texts:
+            return np.array([])
+
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=self.config.max_length
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+        
+        return embeddings
+
+    def _process_chunks(self, texts: List[str], rank: int) -> np.ndarray:
+        """Process chunks of texts on a single GPU."""
+        if not texts:
+            return np.array([])
+
+        device = torch.device(f'cuda:{rank}')
+        embeddings_list = []
+        
+        for i in range(0, len(texts), self.config.batch_size):
+            batch = texts[i:i + self.config.batch_size]
+            if batch:  # Check if batch is not empty
+                batch_embeddings = self._process_batch(batch, device)
+                if batch_embeddings.size > 0:  # Check if embeddings were generated
+                    embeddings_list.append(batch_embeddings)
+
+        return np.vstack(embeddings_list) if embeddings_list else np.array([])
+
+    def _single_device_generation(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings using a single device."""
+        if not texts:
+            return np.array([])
+
+        embeddings_list = []
+        for i in range(0, len(texts), self.config.batch_size):
+            batch = texts[i:i + self.config.batch_size]
+            if batch:
+                batch_embeddings = self._process_batch(batch, self.device)
+                if batch_embeddings.size > 0:
+                    embeddings_list.append(batch_embeddings)
+
+        return np.vstack(embeddings_list) if embeddings_list else np.array([])
+
+    def _distributed_generation(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings using multiple GPUs."""
+        if len(texts) < self.config.min_batch_size * self.num_gpus:
+            self.logger.info("Small batch detected, falling back to single device")
+            return self._single_device_generation(texts)
+
+        try:
+            # Split texts into chunks for each GPU
+            text_chunks = self._split_texts(texts)
+            
+            # Process each chunk on a different GPU
+            embeddings_list = []
+            for rank, chunk in enumerate(text_chunks):
+                if chunk:  # Only process non-empty chunks
+                    embeddings = self._process_chunks(chunk, rank)
+                    if embeddings.size > 0:
+                        embeddings_list.append(embeddings)
+
+            return np.vstack(embeddings_list) if embeddings_list else np.array([])
+
+        except Exception as e:
+            self.logger.error(f"Error in distributed generation: {str(e)}")
+            if self.config.fallback_to_single:
+                self.logger.info("Falling back to single device generation")
+                return self._single_device_generation(texts)
+            raise
+
+    def generate_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings using the most appropriate method."""
+        if not texts:
+            return np.array([])
+
+        try:
+            if self.is_distributed and len(texts) >= self.config.min_batch_size * self.num_gpus:
+                return self._distributed_generation(texts)
+            return self._single_device_generation(texts)
+        
+        except Exception as e:
+            self.logger.error(f"Error generating embeddings: {str(e)}")
+            if self.config.fallback_to_single:
+                self.logger.info("Falling back to single device generation")
+                return self._single_device_generation(texts)
+            raise
+
+
+
 class EmbeddingGenerator:
     def __init__(self, model_name='avsolatorio/NoInstruct-small-Embedding-v0'):
-        logger.info(f"Initializing EmbeddingGenerator with model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model.to(self.device)
-        logger.info(f"EmbeddingGenerator initialized. Device: {self.device}")
+        config = EmbeddingConfig(
+            model_name=model_name,
+            batch_size=32,
+            max_length=512,
+            fallback_to_single=True,
+            min_batch_size=4
+        )
+        self.generator = DistributedEmbeddingGenerator(config)
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Initialized EmbeddingGenerator with model: {model_name}")
 
-    def generate_embeddings(self, texts, batch_size=32):
-        embeddings = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            inputs = self.tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-            batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-            embeddings.append(batch_embeddings)
-        return np.vstack(embeddings)
+    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """Generate embeddings with automatic batch size adjustment."""
+        if not texts:
+            return np.array([])
+            
+        try:
+            return self.generator.generate_embeddings(texts)
+        except Exception as e:
+            self.logger.error(f"Error in embedding generation: {str(e)}")
+            return np.array([])
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -467,11 +609,15 @@ def retrieve_relevant_context(title: str, content: str, domain: str, k: int = 5,
                 (f"{domain.capitalize()} Topic 2", f"Another placeholder document for the {domain} domain."),
                 (f"{domain.capitalize()} Topic 3", f"A third placeholder document for the {domain} domain."),
             ]
-        
         retriever.add_documents(documents_to_add, domain)
-        retriever.save_index()
 
     relevant_contexts = retriever.retrieve(title, content, domain, k=k, title_weight=title_weight)
+
+    # Add the input document to the retriever
+    new_docs = [(title, content)]
+    retriever.add_documents(new_docs, domain)
+    
+    retriever.save_index()
     return relevant_contexts
 
 

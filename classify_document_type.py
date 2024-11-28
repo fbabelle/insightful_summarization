@@ -4,7 +4,7 @@ from collections import Counter
 import tiktoken
 import multiprocessing
 from functools import partial
-from __init__ import domains, model_selection, logger, MAX_TOKENS
+from __init__ import domains, model_selection, logger, MAX_TOKENS, classification_cache
 
 # Initialize tokenizer
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -76,6 +76,16 @@ def classify_document_type(document: str, title: str = "") -> Dict[str, Union[st
     """
     Classify the type of the input document using the selected model with chunking and voting.
     """
+
+    # Generate a unique cache key for the document and title
+    cache_key = f"classification:{hash(document + title)}"
+    
+    # Check cache first
+    cached_result = classification_cache.get(cache_key)
+    if cached_result is not None:
+        logger.info("Cache hit for document classification")
+        return cached_result
+
     chunks = chunk_text(document, max_tokens=MAX_TOKENS // 2)
     # chunks = chunk_text(document, max_tokens=30)
     
@@ -124,6 +134,10 @@ def classify_document_type(document: str, title: str = "") -> Dict[str, Union[st
     if "OUTLIER" in result.get("domain", []) or result.get("domain") == "OUTLIER":
         suggested_domains = [c['suggested_domain'] for c in chunk_classifications if c['classification'] == "OUTLIER" and c['suggested_domain']]
         result["suggested_domains"] = list(set(suggested_domains))
+
+    # Cache the result
+    token_count = num_tokens_from_string(str(result))
+    classification_cache.put(cache_key, result, token_count)
 
     logger.info(f"Final classification result: {result}")
     return result
